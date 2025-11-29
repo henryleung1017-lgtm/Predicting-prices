@@ -15,13 +15,13 @@
 - Approximates ensemble confidence intervals instead of omitting uncertainty entirely, giving users some sense of variability.
 
 ## Key issues, risks, and current mitigation status
-- **Missing data handling (partially mitigated)**: The script now validates the presence of all required forecast/metric files before running and raises a clear error if any are missing. Column-level validation is still minimal, so corrupt or schema-drifted files could slip through unnoticed.
-- **Confidence interval assumptions (open)**: The CI still assumes uncorrelated model errors and uses RMSE approximations; correlated errors could understate uncertainty.
-- **Metric consistency (open)**: Directional metrics for LSTM remain `NaN`, and ensemble directional metrics are not derived. Tables can still look “complete” while omitting these measures.
-- **Weight robustness (partially mitigated)**: Weight calculation now warns when no RMSE weights exist for a ticker/frequency and avoids crashes when weights are absent during summary construction. However, there are still no recency or coverage checks on the metrics themselves.
-- **Data leakage / download cost (open)**: Plotting still downloads full Yahoo Finance histories without caching or alignment checks against training data.
-- **Testing and automation (partially mitigated)**: The pipeline remains driven by `main()`, but input validation and clearer warnings make failures earlier and more visible. There are still no unit tests or CLI flags to control plotting/downloading.
-- **Performance (open)**: Groupby-heavy processing and per-ticker Yahoo downloads remain single-threaded with no caching or batching.
+- **Missing data handling (mitigated)**: The script validates the presence of all required forecast/metric files before running and now enforces column-level schema and numeric checks to catch drift or corrupt values early.
+- **Confidence interval assumptions (partially mitigated)**: Confidence intervals can now assume a user-configurable pairwise error correlation (default 0.5) to widen bands when errors are likely correlated. Actual residual correlations are still unknown.
+- **Metric consistency (partially mitigated)**: Directional metrics are aggregated for the ensemble when available, and coverage per row is exposed so missing directional metrics are visible. LSTM directional metrics remain `NaN` when not produced upstream.
+- **Weight robustness (mitigated)**: Weight calculation keeps the prior warnings for missing RMSEs and now validates metric numeric values, checks for stale metrics when date columns exist, and warns when forecasts lack accompanying metrics.
+- **Data leakage / download cost (partially mitigated)**: Plotting can optionally bound history downloads by start date and cache Yahoo Finance responses locally to avoid repeated full-history downloads. Alignment with training spans is still not enforced.
+- **Testing and automation (partially mitigated)**: CLI flags now gate plotting, network access, CI correlation assumptions, history download bounds/cache, and metric recency warnings, but formal unit tests are still absent.
+- **Performance (partially mitigated)**: Caching downloaded histories reduces repeat network calls, but groupby operations and plotting remain single-threaded.
 
 ## Suggested next steps
 - Add column-level validation (required headers, dtypes) alongside file existence checks to catch schema drift early.

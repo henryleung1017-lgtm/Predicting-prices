@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -70,6 +71,8 @@ REQUIRED_METRIC_COLUMNS = {
     "RMSE",
     "MAE",
 }
+METRIC_DATE_COLUMNS = ["TrainEnd", "TestEnd", "TrainEndDate", "TestEndDate"]
+DIRECTIONAL_COLS = ["DirectionAccuracy", "DirectionPrecision", "DirectionRecall"]
 
 
 # ============================================================
@@ -80,6 +83,19 @@ def _require_columns(df: pd.DataFrame, required: Iterable[str], *, context: str)
     missing = set(required) - set(df.columns)
     if missing:
         raise ValueError(f"Missing columns {sorted(missing)} in {context}")
+    return df
+
+
+def _validate_numeric_columns(df: pd.DataFrame, numeric_cols: Iterable[str], *, context: str) -> pd.DataFrame:
+    """Ensure numeric columns are coercible to float and contain finite values."""
+
+    for col in numeric_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing numeric column '{col}' in {context}")
+        coerced = pd.to_numeric(df[col], errors="coerce")
+        if coerced.isna().any():
+            raise ValueError(f"Non-numeric or missing values found in column '{col}' for {context}")
+        df[col] = coerced.astype(float)
     return df
 
 
@@ -116,6 +132,44 @@ def validate_required_files(files: InputFiles, frequencies: Sequence[str]) -> No
         )
 
 
+def validate_metric_recency(metrics_all: pd.DataFrame, *, max_age_days: Optional[int], context: str) -> None:
+    """Warn if metrics look stale when date columns are present.
+
+    If no known date columns exist, the function exits quietly because the
+    script cannot assess recency.
+    """
+
+    if max_age_days is None:
+        return
+
+    date_cols_present = [c for c in METRIC_DATE_COLUMNS if c in metrics_all.columns]
+    if not date_cols_present:
+        LOGGER.warning(
+            "Recency check skipped for %s: no date columns found among %s",
+            context,
+            METRIC_DATE_COLUMNS,
+        )
+        return
+
+    now = pd.Timestamp(datetime.utcnow().date())
+    recent_mask: List[bool] = []
+    for col in date_cols_present:
+        parsed = pd.to_datetime(metrics_all[col], errors="coerce")
+        age_days = (now - parsed).dt.days
+        recent_mask.append(age_days <= max_age_days)
+
+    combined_recent = pd.concat(recent_mask, axis=1).any(axis=1)
+    stale = metrics_all.loc[~combined_recent, ["Ticker", "frequency"]].drop_duplicates()
+    if not stale.empty:
+        stale_pairs = "; ".join(f"{t} ({f})" for t, f in stale.values)
+        LOGGER.warning(
+            "Metrics older than %s days for: %s (source columns: %s)",
+            max_age_days,
+            stale_pairs,
+            ", ".join(date_cols_present),
+        )
+
+
 # ============================================================
 # FORECAST LOADERS (PER MODEL)
 # ============================================================
@@ -126,6 +180,7 @@ def load_lstm_forecast(freq: str, files: InputFiles) -> pd.DataFrame:
     fname = files.lstm_daily if freq == "daily" else files.lstm_monthly
     df = _read_csv(fname, parse_dates=["Date"])
     _require_columns(df, REQUIRED_FORECAST_COLUMNS, context=f"LSTM {freq} forecast")
+    _validate_numeric_columns(df, ["PredictedPrice"], context=f"LSTM {freq} forecast")
     df = df.assign(Model="LSTM", Frequency=freq)
     return df[["Ticker", "Date", "Frequency", "Model", "PredictedPrice"]]
 
@@ -135,6 +190,7 @@ def load_sarimax_forecast(freq: str, files: InputFiles) -> pd.DataFrame:
     fname = files.sarimax_daily if freq == "daily" else files.sarimax_monthly
     df = _read_csv(fname, parse_dates=["Date"])
     _require_columns(df, REQUIRED_FORECAST_COLUMNS, context=f"SARIMAX {freq} forecast")
+    _validate_numeric_columns(df, ["PredictedPrice"], context=f"SARIMAX {freq} forecast")
     df = df.assign(Model="SARIMAX", Frequency=freq)
     return df[["Ticker", "Date", "Frequency", "Model", "PredictedPrice"]]
 
@@ -144,6 +200,7 @@ def load_gru_forecast(freq: str, files: InputFiles) -> pd.DataFrame:
     fname = files.gru_daily if freq == "daily" else files.gru_monthly
     df = _read_csv(fname, parse_dates=["Date"])
     _require_columns(df, REQUIRED_FORECAST_COLUMNS, context=f"GRU {freq} forecast")
+    _validate_numeric_columns(df, ["PredictedPrice"], context=f"GRU {freq} forecast")
     df = df.assign(Model="GRU", Frequency=freq)
     return df[["Ticker", "Date", "Frequency", "Model", "PredictedPrice"]]
 
@@ -160,6 +217,10 @@ def _ensure_metric_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _validate_metric_numeric(df: pd.DataFrame, *, context: str) -> pd.DataFrame:
+    return _validate_numeric_columns(df, ["MAE", "RMSE"], context=context)
+
+
 def load_lstm_metrics(freq: str, files: InputFiles) -> pd.DataFrame:
     freq = _normalize_frequency(freq)
     fname = files.lstm_daily_metrics if freq == "daily" else files.lstm_monthly_metrics
@@ -168,6 +229,7 @@ def load_lstm_metrics(freq: str, files: InputFiles) -> pd.DataFrame:
     df["frequency"] = df["Mode"].str.lower()
     df = df[df["frequency"] == freq]
     df = _ensure_metric_columns(df)
+    df = _validate_metric_numeric(df, context=f"LSTM {freq} metrics")
     return df[[
         "Ticker",
         "frequency",
@@ -188,6 +250,7 @@ def load_sarimax_metrics(freq: str, files: InputFiles) -> pd.DataFrame:
     df["frequency"] = df["Frequency"].str.lower()
     df = df[df["frequency"] == freq]
     df = _ensure_metric_columns(df)
+    df = _validate_metric_numeric(df, context=f"SARIMAX {freq} metrics")
     return df[[
         "Ticker",
         "frequency",
@@ -215,6 +278,7 @@ def load_gru_metrics(freq: str, files: InputFiles) -> pd.DataFrame:
     df["frequency"] = df["frequency"].str.lower()
     df = df[df["frequency"] == freq]
     df = _ensure_metric_columns(df)
+    df = _validate_metric_numeric(df, context=f"GRU {freq} metrics")
     return df[[
         "Ticker",
         "frequency",
@@ -234,7 +298,37 @@ def load_all_metrics(freq: str, files: InputFiles) -> pd.DataFrame:
         load_sarimax_metrics(freq, files),
         load_gru_metrics(freq, files),
     ]
-    return pd.concat(metrics_frames, ignore_index=True, sort=False)
+    metrics = pd.concat(metrics_frames, ignore_index=True, sort=False)
+    return metrics
+
+
+def warn_on_missing_direction_metrics(metrics_all: pd.DataFrame, freq: str) -> None:
+    has_dir = metrics_all[DIRECTIONAL_COLS].notna().any(axis=1)
+    missing = metrics_all.loc[~has_dir, ["Ticker", "frequency", "Model"]]
+    if missing.empty:
+        return
+    pairs = "; ".join(sorted({f"{t} ({f}) [{m}]" for t, f, m in missing.values}))
+    LOGGER.warning("Directional metrics missing for %s: %s", freq, pairs)
+
+
+def warn_on_metric_coverage(forecasts: pd.DataFrame, metrics_all: pd.DataFrame, freq: str) -> None:
+    forecast_pairs = set(zip(forecasts["Ticker"], forecasts["Frequency"]))
+    metric_pairs = set(zip(metrics_all["Ticker"], metrics_all["frequency"]))
+    missing_pairs = forecast_pairs - metric_pairs
+    if missing_pairs:
+        LOGGER.warning(
+            "Forecasts lack metrics for %s: %s",
+            freq,
+            "; ".join(sorted(f"{t} ({f})" for t, f in missing_pairs)),
+        )
+
+
+def warn_on_nonpositive_metrics(metrics_all: pd.DataFrame, freq: str) -> None:
+    invalid = metrics_all[(metrics_all["RMSE"] <= 0) | (metrics_all["MAE"] <= 0)]
+    if invalid.empty:
+        return
+    pairs = "; ".join(sorted({f"{t} ({f}) [{m}]" for t, f, m in invalid[["Ticker", "frequency", "Model"]].values}))
+    LOGGER.warning("Non-positive MAE/RMSE values found for %s: %s", freq, pairs)
 
 
 # ============================================================
@@ -262,8 +356,13 @@ def build_weight_table_from_metrics(metrics_all: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def compute_ensemble_sigma_lookup(metrics_all: pd.DataFrame, weights_df: pd.DataFrame) -> Dict[Tuple[str, str], float]:
+def compute_ensemble_sigma_lookup(
+    metrics_all: pd.DataFrame, weights_df: pd.DataFrame, *, assumed_correlation: float
+) -> Dict[Tuple[str, str], float]:
     sigma_lookup: Dict[Tuple[str, str], float] = {}
+    if assumed_correlation < 0 or assumed_correlation > 1:
+        raise ValueError("assumed_correlation must be between 0 and 1")
+
     for (ticker, freq), w_group in weights_df.groupby(["Ticker", "Frequency"]):
         m_group = metrics_all[(metrics_all["Ticker"] == ticker) & (metrics_all["frequency"] == freq)]
         merged = w_group.merge(
@@ -280,8 +379,16 @@ def compute_ensemble_sigma_lookup(metrics_all: pd.DataFrame, weights_df: pd.Data
 
         rmse_vals = merged["RMSE"].to_numpy()
         w_vals = merged["Weight"].to_numpy()
-        ensemble_mse = float(np.sum((w_vals ** 2) * (rmse_vals ** 2)))
-        sigma_lookup[(ticker, freq)] = float(np.sqrt(ensemble_mse))
+        diag_var = float(np.sum((w_vals ** 2) * (rmse_vals ** 2)))
+
+        if rmse_vals.size > 1 and assumed_correlation > 0:
+            outer = np.outer(w_vals * rmse_vals, w_vals * rmse_vals)
+            cross_terms = float(outer.sum() - np.sum((w_vals ** 2) * (rmse_vals ** 2)))
+            ensemble_var = diag_var + assumed_correlation * cross_terms
+        else:
+            ensemble_var = diag_var
+
+        sigma_lookup[(ticker, freq)] = float(np.sqrt(ensemble_var))
     return sigma_lookup
 
 
@@ -306,6 +413,7 @@ def build_ensemble_performance_summary(metrics_all: pd.DataFrame, weights_df: pd
                 "DirectionAccuracy": row["DirectionAccuracy"],
                 "DirectionPrecision": row["DirectionPrecision"],
                 "DirectionRecall": row["DirectionRecall"],
+                "DirectionMetricCoverage": float(pd.notna(row[DIRECTIONAL_COLS]).mean()),
                 "Weight": float(weight_val) if pd.notna(weight_val) else np.nan,
                 "IsEnsemble": False,
             })
@@ -331,6 +439,18 @@ def build_ensemble_performance_summary(metrics_all: pd.DataFrame, weights_df: pd
         ensemble_rmse = float(np.sqrt(np.sum((w_vals ** 2) * (rmse_vals ** 2))))
         ensemble_mae = float(np.sum(w_vals * mae_vals))
 
+        dir_metrics: Dict[str, float] = {}
+        coverage_values: List[float] = []
+        for col in DIRECTIONAL_COLS:
+            available_mask = merged[col].notna().to_numpy()
+            coverage_values.append(float(available_mask.mean()))
+            if available_mask.any():
+                weights_subset = w_vals[available_mask]
+                metrics_subset = merged.loc[available_mask, col].to_numpy()
+                dir_metrics[col] = float(np.sum((weights_subset / weights_subset.sum()) * metrics_subset))
+            else:
+                dir_metrics[col] = np.nan
+
         rows.append({
             "Ticker": ticker,
             "Frequency": freq,
@@ -338,9 +458,10 @@ def build_ensemble_performance_summary(metrics_all: pd.DataFrame, weights_df: pd
             "MAE": ensemble_mae,
             "RMSE": ensemble_rmse,
             "R2": np.nan,
-            "DirectionAccuracy": np.nan,
-            "DirectionPrecision": np.nan,
-            "DirectionRecall": np.nan,
+            "DirectionAccuracy": dir_metrics["DirectionAccuracy"],
+            "DirectionPrecision": dir_metrics["DirectionPrecision"],
+            "DirectionRecall": dir_metrics["DirectionRecall"],
+            "DirectionMetricCoverage": float(np.mean(coverage_values)) if coverage_values else np.nan,
             "Weight": 1.0,
             "IsEnsemble": True,
         })
@@ -353,7 +474,13 @@ def build_ensemble_performance_summary(metrics_all: pd.DataFrame, weights_df: pd
 # ============================================================
 
 
-def ensemble_for_frequency(freq: str, files: InputFiles) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def ensemble_for_frequency(
+    freq: str,
+    files: InputFiles,
+    *,
+    metric_recency_days: Optional[int],
+    assumed_correlation: float,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     freq = _normalize_frequency(freq)
     lstm_fc = load_lstm_forecast(freq, files)
     sarima_fc = load_sarimax_forecast(freq, files)
@@ -361,8 +488,13 @@ def ensemble_for_frequency(freq: str, files: InputFiles) -> Tuple[pd.DataFrame, 
 
     forecasts = pd.concat([lstm_fc, sarima_fc, gru_fc], ignore_index=True)
     metrics_all = load_all_metrics(freq, files)
+    warn_on_missing_direction_metrics(metrics_all, freq)
+    warn_on_nonpositive_metrics(metrics_all, freq)
+    warn_on_metric_coverage(forecasts, metrics_all, freq)
+    validate_metric_recency(metrics_all, max_age_days=metric_recency_days, context=f"{freq} metrics")
+
     weights_df = build_weight_table_from_metrics(metrics_all)
-    sigma_lookup = compute_ensemble_sigma_lookup(metrics_all, weights_df)
+    sigma_lookup = compute_ensemble_sigma_lookup(metrics_all, weights_df, assumed_correlation=assumed_correlation)
 
     weight_pairs = set(zip(weights_df["Ticker"], weights_df["Frequency"]))
     forecast_pairs = set(zip(forecasts["Ticker"], forecasts["Frequency"]))
@@ -440,9 +572,55 @@ def plot_rmse_bar_chart(summary_df: pd.DataFrame, freq: str) -> None:
     plt.show()
 
 
-def plot_actual_vs_ensemble(ensemble_df: pd.DataFrame, freq: str, *, max_tickers: int = 3, allow_network: bool = True) -> None:
+def fetch_price_history(
+    ticker: str,
+    *,
+    history_start: Optional[pd.Timestamp],
+    cache_dir: Optional[Path],
+    allow_network: bool,
+) -> pd.DataFrame:
+    """Fetch historical prices with optional caching and date bounding."""
+
+    cache_path = cache_dir / f"{ticker}.csv" if cache_dir else None
+    if cache_path and cache_path.exists():
+        try:
+            cached = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+            if history_start is not None:
+                cached = cached[cached.index >= history_start]
+            return cached
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to read cache for %s: %s", ticker, exc)
+
     if not allow_network:
-        LOGGER.info("Skipping Yahoo Finance downloads because allow_network=False")
+        LOGGER.info("Skipping download for %s because allow_network=False and cache missing", ticker)
+        return pd.DataFrame()
+
+    download_kwargs = {"period": "max", "auto_adjust": True, "progress": False}
+    if history_start is not None:
+        download_kwargs["start"] = history_start
+
+    hist = yf.download(ticker, **download_kwargs)
+    if hist.empty:
+        return pd.DataFrame()
+
+    if cache_path:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        hist.to_csv(cache_path)
+
+    return hist
+
+
+def plot_actual_vs_ensemble(
+    ensemble_df: pd.DataFrame,
+    freq: str,
+    *,
+    max_tickers: int = 3,
+    allow_network: bool = True,
+    history_start: Optional[pd.Timestamp] = None,
+    cache_dir: Optional[Path] = None,
+) -> None:
+    if not allow_network and cache_dir is None:
+        LOGGER.info("Skipping Yahoo Finance downloads because allow_network=False and no cache provided")
         return
 
     tickers = ensemble_df["Ticker"].unique()[:max_tickers]
@@ -452,9 +630,9 @@ def plot_actual_vs_ensemble(ensemble_df: pd.DataFrame, freq: str, *, max_tickers
             continue
         forecast_start = df_pred["Date"].min()
 
-        hist = yf.download(ticker, period="max", auto_adjust=True, progress=False)
+        hist = fetch_price_history(ticker, history_start=history_start, cache_dir=cache_dir, allow_network=allow_network)
         if hist.empty:
-            LOGGER.warning("No historical data downloaded for %s", ticker)
+            LOGGER.warning("No historical data available for %s", ticker)
             continue
 
         price_col = "Close" if "Close" in hist.columns else hist.columns[0]
@@ -487,12 +665,29 @@ def _save_dataframe(df: pd.DataFrame, path: Path) -> None:
     LOGGER.info("Saved %s rows to %s", len(df), path.resolve())
 
 
-def run_pipeline(frequencies: Sequence[str], files: InputFiles, *, output_dir: Path, plot: bool, max_tickers: int, allow_network: bool) -> None:
+def run_pipeline(
+    frequencies: Sequence[str],
+    files: InputFiles,
+    *,
+    output_dir: Path,
+    plot: bool,
+    max_tickers: int,
+    allow_network: bool,
+    metric_recency_days: Optional[int],
+    assumed_correlation: float,
+    history_start: Optional[pd.Timestamp],
+    history_cache_dir: Optional[Path],
+) -> None:
     validate_required_files(files, frequencies)
     all_summaries: List[pd.DataFrame] = []
     for freq in frequencies:
         LOGGER.info("Building ensemble forecast for %s", freq)
-        ensemble_df, metrics_all, weights_df = ensemble_for_frequency(freq, files)
+        ensemble_df, metrics_all, weights_df = ensemble_for_frequency(
+            freq,
+            files,
+            metric_recency_days=metric_recency_days,
+            assumed_correlation=assumed_correlation,
+        )
         freq_dir = output_dir
 
         out_path = freq_dir / f"ensemble_20y_{freq}_forecast.csv"
@@ -503,7 +698,14 @@ def run_pipeline(frequencies: Sequence[str], files: InputFiles, *, output_dir: P
 
         if plot:
             plot_rmse_bar_chart(summary_df, freq=freq)
-            plot_actual_vs_ensemble(ensemble_df, freq=freq, max_tickers=max_tickers, allow_network=allow_network)
+            plot_actual_vs_ensemble(
+                ensemble_df,
+                freq=freq,
+                max_tickers=max_tickers,
+                allow_network=allow_network,
+                history_start=history_start,
+                cache_dir=history_cache_dir,
+            )
 
     if all_summaries:
         performance_summary = pd.concat(all_summaries, ignore_index=True)
@@ -519,6 +721,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--plot", action="store_true", help="Generate RMSE and price-path plots.")
     parser.add_argument("--max-tickers", type=int, default=3, help="Max tickers to plot when --plot is set.")
     parser.add_argument("--allow-network", action="store_true", help="Allow network calls (Yahoo Finance) when plotting.")
+    parser.add_argument("--history-start", type=str, default=None, help="Optional YYYY-MM-DD start date for historical downloads.")
+    parser.add_argument("--history-cache-dir", type=Path, default=None, help="Directory for caching Yahoo Finance history to avoid repeat downloads.")
+    parser.add_argument("--metric-recency-days", type=int, default=None, help="Warn when metrics are older than this many days (requires date columns).")
+    parser.add_argument(
+        "--ci-correlation",
+        type=float,
+        default=0.5,
+        help="Assumed pairwise correlation (0-1) between model errors when estimating CI; higher widens intervals.",
+    )
     parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR).")
     return parser.parse_args(argv)
 
@@ -529,9 +740,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     files = InputFiles()
     frequencies = [_normalize_frequency(f) for f in args.frequencies]
+    history_start = pd.to_datetime(args.history_start).tz_localize(None) if args.history_start else None
 
     try:
-        run_pipeline(frequencies, files, output_dir=args.output_dir, plot=args.plot, max_tickers=args.max_tickers, allow_network=args.allow_network)
+        run_pipeline(
+            frequencies,
+            files,
+            output_dir=args.output_dir,
+            plot=args.plot,
+            max_tickers=args.max_tickers,
+            allow_network=args.allow_network,
+            metric_recency_days=args.metric_recency_days,
+            assumed_correlation=args.ci_correlation,
+            history_start=history_start,
+            history_cache_dir=args.history_cache_dir,
+        )
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("Pipeline failed: %s", exc)
         raise
