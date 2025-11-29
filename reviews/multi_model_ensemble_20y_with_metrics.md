@@ -15,18 +15,17 @@
 - Approximates ensemble confidence intervals instead of omitting uncertainty entirely, giving users some sense of variability.
 
 ## Key issues, risks, and current mitigation status
-- **Missing data handling (mitigated)**: The script validates the presence of all required forecast/metric files before running and now enforces column-level schema and numeric checks to catch drift or corrupt values early.
-- **Confidence interval assumptions (partially mitigated)**: Confidence intervals can now assume a user-configurable pairwise error correlation (default 0.5) to widen bands when errors are likely correlated. Actual residual correlations are still unknown.
+- **Missing data handling (mitigated)**: The script validates the presence of all required forecast/metric files before running, enforces column-level schema and numeric checks, and warns when forecasts lack supporting metrics or when metric values are stale or non-positive.
+- **Confidence interval assumptions (partially mitigated)**: Confidence intervals can assume a user-configurable pairwise error correlation (default 0.5) to widen bands when errors are likely correlated. Actual residual correlations remain unknown, so intervals may still be optimistic.
 - **Metric consistency (partially mitigated)**: Directional metrics are aggregated for the ensemble when available, and coverage per row is exposed so missing directional metrics are visible. LSTM directional metrics remain `NaN` when not produced upstream.
-- **Weight robustness (mitigated)**: Weight calculation keeps the prior warnings for missing RMSEs and now validates metric numeric values, checks for stale metrics when date columns exist, and warns when forecasts lack accompanying metrics.
-- **Data leakage / download cost (partially mitigated)**: Plotting can optionally bound history downloads by start date and cache Yahoo Finance responses locally to avoid repeated full-history downloads. Alignment with training spans is still not enforced.
-- **Testing and automation (partially mitigated)**: CLI flags now gate plotting, network access, CI correlation assumptions, history download bounds/cache, and metric recency warnings, but formal unit tests are still absent.
-- **Performance (partially mitigated)**: Caching downloaded histories reduces repeat network calls, but groupby operations and plotting remain single-threaded.
+- **Weight robustness (partially mitigated)**: Weight calculation validates numeric metrics, warns for stale metrics and missing RMSEs, and avoids crashes when forecasts lack accompanying metrics. Recency/coverage checks on the training spans of metrics are still shallow.
+- **Data leakage / download cost (partially mitigated)**: Plotting can bound history downloads by start date and cache Yahoo Finance responses to avoid repeated full-history downloads. Alignment with training spans, adjustment conventions, and leakage guards are still not enforced.
+- **Testing and automation (partially mitigated)**: CLI flags gate plotting, network access, CI correlation assumptions, history download bounds/cache, metric recency warnings, and forecast validation, but formal unit tests and CI automation are still absent.
+- **Performance (partially mitigated)**: Caching downloaded histories reduces repeat network calls, but groupby operations, validation, and plotting remain single-threaded with no batching for large ticker sets.
 
 ## Suggested next steps
-- Add column-level validation (required headers, dtypes) alongside file existence checks to catch schema drift early.
-- Introduce CLI flags or configuration to disable plotting, skip Yahoo downloads, select frequencies, and control output paths for automated workflows.
-- Cache or pre-download historical price data and align it to the same adjustment convention as training to avoid leakage and speed up plotting.
-- Compute or approximate ensemble directional metrics instead of leaving them `NaN`, or clearly surface their absence in reports.
-- Add lightweight tests for weighting, aggregation, and validation logic, and refactor plotting into optional, importable functions to ease automation.
-- Profile large runs and consider batching or multiprocessing for forecast aggregation and history fetching.
+- Empirically estimate residual correlations between models and calibrate confidence intervals through backtests instead of relying solely on the configurable default.
+- Derive directional metrics for LSTM forecasts (or downstream) so ensemble directional coverage is complete, or explicitly mark unsupported tickers/frequencies.
+- Tighten leakage controls by aligning historical downloads to the training spans/adjustment conventions and enforcing explicit validation of lookback windows.
+- Add lightweight unit tests for validation, weighting, recency checks, and CI construction, and wire them into CI along with non-plotting CLI smoke tests.
+- Profile and batch groupby-heavy steps and Yahoo downloads (e.g., multiprocessing or per-frequency caching) to handle larger ticker universes.
