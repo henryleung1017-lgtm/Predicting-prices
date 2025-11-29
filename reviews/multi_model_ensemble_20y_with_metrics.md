@@ -14,19 +14,19 @@
 - Provides a reasonable fallback (equal weights) when metrics are missing, preventing the pipeline from failing outright.
 - Approximates ensemble confidence intervals instead of omitting uncertainty entirely, giving users some sense of variability.
 
-## Key issues and risks
-- **Missing data handling**: The script assumes many CSVs exist (multiple forecast and metric files). Missing files or columns will raise errors; there is no validation or friendly error messaging.
-- **Confidence interval assumptions**: The CI uses RMSE and assumes uncorrelated model errors; this is a strong assumption and may understate uncertainty if errors are correlated.
-- **Metric consistency**: Directional metrics for LSTM are set to `NaN`, and ensemble directional metrics are always `NaN`; the output tables may give a false sense of completeness.
-- **Weight robustness**: If metrics are stale or inconsistent across frequencies, weights may be misaligned with the forecast data. No sanity checks ensure the metric currency or coverage matches forecast horizons.
-- **Data leakage risk**: Downloading the entire historical series (`period="max"`) from Yahoo Finance inside plotting without caching can be slow and may mix adjusted/unadjusted prices differently from training data.
-- **Lack of testing/CLIs**: Everything runs in `main()` with plotting side effects, making automation or unit testing difficult. No entry-point flags to limit plotting or switch off downloads.
-- **Performance**: For many tickers/dates, repeated groupby operations and Yahoo downloads may be slow; there is no batching or parallelization.
+## Key issues, risks, and current mitigation status
+- **Missing data handling (partially mitigated)**: The script now validates the presence of all required forecast/metric files before running and raises a clear error if any are missing. Column-level validation is still minimal, so corrupt or schema-drifted files could slip through unnoticed.
+- **Confidence interval assumptions (open)**: The CI still assumes uncorrelated model errors and uses RMSE approximations; correlated errors could understate uncertainty.
+- **Metric consistency (open)**: Directional metrics for LSTM remain `NaN`, and ensemble directional metrics are not derived. Tables can still look “complete” while omitting these measures.
+- **Weight robustness (partially mitigated)**: Weight calculation now warns when no RMSE weights exist for a ticker/frequency and avoids crashes when weights are absent during summary construction. However, there are still no recency or coverage checks on the metrics themselves.
+- **Data leakage / download cost (open)**: Plotting still downloads full Yahoo Finance histories without caching or alignment checks against training data.
+- **Testing and automation (partially mitigated)**: The pipeline remains driven by `main()`, but input validation and clearer warnings make failures earlier and more visible. There are still no unit tests or CLI flags to control plotting/downloading.
+- **Performance (open)**: Groupby-heavy processing and per-ticker Yahoo downloads remain single-threaded with no caching or batching.
 
-## Suggested improvements
-- Add explicit file existence checks with clear errors, and validate required columns before merging.
-- Surface configuration/CLI flags (e.g., disable plotting, select frequency, choose number of tickers, set output paths) to support automated runs.
-- Cache or prefetch Yahoo Finance history and align it with the training price definitions (adjusted vs. raw) to avoid mismatches.
-- Extend metric calculations so the ensemble directional metrics are computed rather than left `NaN`.
-- Factor plotting and I/O side effects behind flags or functions to make the core ensemble computation importable and testable.
-- Add docstrings or type hints to helper functions that perform merges and weighting to clarify expectations and edge cases.
+## Suggested next steps
+- Add column-level validation (required headers, dtypes) alongside file existence checks to catch schema drift early.
+- Introduce CLI flags or configuration to disable plotting, skip Yahoo downloads, select frequencies, and control output paths for automated workflows.
+- Cache or pre-download historical price data and align it to the same adjustment convention as training to avoid leakage and speed up plotting.
+- Compute or approximate ensemble directional metrics instead of leaving them `NaN`, or clearly surface their absence in reports.
+- Add lightweight tests for weighting, aggregation, and validation logic, and refactor plotting into optional, importable functions to ease automation.
+- Profile large runs and consider batching or multiprocessing for forecast aggregation and history fetching.
